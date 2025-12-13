@@ -19,10 +19,20 @@ with col2:
 elexon_key = st.secrets.get("ELEXON_API_KEY", "DEMO")  # Get free at bmrs.elexon.co.uk
 
 @st.cache_data(ttl=900)  # 15min cache
-def get_lat_lon(postcode):
-    geolocator = Nominatim(user_agent="iog_app")
-    location = geolocator.geocode(postcode)
-    return location.latitude, location.longitude if location else 51.5074, -0.1278
+
+def get_lat_lon(postcode: str):
+    geolocator = Nominatim(user_agent="iog_app", timeout=5)
+    try:
+        location = geolocator.geocode(postcode)
+    except Exception:
+        location = None
+
+    # Fallback to London if geocoding fails or returns None
+    if location is None:
+        return 51.5074, -0.1278
+
+    return float(location.latitude), float(location.longitude)
+
 
 @st.cache_data(ttl=900)
 def fetch_agile_prices(region):
