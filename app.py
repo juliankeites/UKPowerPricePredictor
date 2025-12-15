@@ -104,31 +104,33 @@ def floor_to_half_hour(ts: pd.Series) -> pd.Series:
 def compute_cheapness(agile_df: pd.DataFrame,
                       system_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Join Agile and system prices by half hour, then compute a 0–100 cheapness score:
-    - normalise Agile vs its min/max over the window
-    - normalise system price vs its min/max over the window
-    - cheapness = 100 * (1 - 0.5*agile_norm - 0.5*system_norm)
+    Compute cheapness only on the overlapping time window between Agile and system prices.
     """
     if agile_df.empty or system_df.empty:
         return pd.DataFrame()
 
-    df_a = agile_df.copy()
-    df_s = system_df.copy()
+    # Find overlap window
+    start_overlap = max(agile_df["start"].min(), system_df["start"].min())
+    end_overlap = min(agile_df["start"].max(), system_df["start"].max())
+    if start_overlap >= end_overlap:
+        return pd.DataFrame()
 
-    # Align both to half-hour buckets
-    df_a["slot"] = floor_to_half_hour(df_a["start"])
-    df_s["slot"] = floor_to_half_hour(df_s["start"])
+    # Restrict both to that window
+    a = agile_df[(agile_df["start"] >= start_overlap) & (agile_df["start"] <= end_overlap)].copy()
+    s = system_df[(system_df["start"] >= start_overlap) & (system_df["start"] <= end_overlap)].copy()
 
-    # Aggregate in case of duplicates
-    df_a = df_a.groupby("slot", as_index=False).agg(
+    # Align to half-hour buckets
+    a["slot"] = floor_to_half_hour(a["start"])
+    s["slot"] = floor_to_half_hour(s["start"])
+
+    a = a.groupby("slot", as_index=False).agg(
         {"agile_p_per_kwh": "mean", "end": "max"}
     )
-    df_s = df_s.groupby("slot", as_index=False).agg(
+    s = s.groupby("slot", as_index=False).agg(
         {"system_p_per_kwh": "mean"}
     )
 
-    # Only overlapping periods
-    df = pd.merge(df_a, df_s, on="slot", how="inner")
+    df = pd.merge(a, s, on="slot", how="inner")
     if df.empty:
         return pd.DataFrame()
 
@@ -136,21 +138,13 @@ def compute_cheapness(agile_df: pd.DataFrame,
 
     # Normalise Agile
     a_min, a_max = df["agile_p_per_kwh"].min(), df["agile_p_per_kwh"].max()
-    if a_max > a_min:
-        df["agile_norm"] = (df["agile_p_per_kwh"] - a_min) / (a_max - a_min)
-    else:
-        df["agile_norm"] = 0.5
+    df["agile_norm"] = (df["agile_p_per_kwh"] - a_min) / (a_max - a_min) if a_max > a_min else 0.5
 
     # Normalise system price
     s_min, s_max = df["system_p_per_kwh"].min(), df["system_p_per_kwh"].max()
-    if s_max > s_min:
-        df["system_norm"] = (df["system_p_per_kwh"] - s_min) / (s_max - s_min)
-    else:
-        df["system_norm"] = 0.5
+    df["system_norm"] = (df["system_p_per_kwh"] - s_min) / (s_max - s_min) if s_max > s_min else 0.5
 
     df["cheapness_score"] = 100 * (1 - 0.5 * df["agile_norm"] - 0.5 * df["system_norm"])
-
-    # Approximate end time as start + 30 minutes
     df["end"] = df["start"] + pd.Timedelta("30min")
 
     return df[["start", "end", "agile_p_per_kwh", "system_p_per_kwh", "cheapness_score"]]
