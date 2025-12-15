@@ -53,14 +53,13 @@ def get_system_prices_for_range(start_utc: dt.datetime,
                                 end_utc: dt.datetime) -> pd.DataFrame:
     """
     Get system prices from Elexon Insights (DISEBSP) for all settlement dates
-    covered by [start_utc, end_utc). Returns UTC 'start' and p/kWh.
+    covered by [start_utc, end_utc). Returns UTC 'start' and price in p/kWh.
     """
     base_url = (
         "https://data.elexon.co.uk/bmrs/api/v1/"
         "balancing/settlement/system-prices"
     )
 
-    # All settlement dates in the Agile window
     start_date = start_utc.date()
     end_date = end_utc.date()
     days = (end_date - start_date).days + 1
@@ -74,9 +73,11 @@ def get_system_prices_for_range(start_utc: dt.datetime,
         r = requests.get(url, timeout=15)
         r.raise_for_status()
         data = r.json()
+
         items = data.get("data") or []
         if not items:
             continue
+
         df_d = pd.DataFrame(items)
         dfs.append(df_d)
 
@@ -84,21 +85,26 @@ def get_system_prices_for_range(start_utc: dt.datetime,
         return pd.DataFrame()
 
     df = pd.concat(dfs, ignore_index=True)
+
+    # Time: startTime is UTC ISO8601
     df["start"] = pd.to_datetime(df["startTime"], utc=True)
+
+    # Price: systemSellPrice in GBP/MWh -> p/kWh
     df["system_gbp_per_mwh"] = df["systemSellPrice"].astype(float)
     df["system_p_per_kwh"] = df["system_gbp_per_mwh"] * 100 / 1000
 
-    # Keep only rows that fall inside the Agile time window
+    # Keep only rows within the Agile window
     mask = (df["start"] >= start_utc) & (df["start"] < end_utc)
     df = df.loc[mask].sort_values("start").reset_index(drop=True)
-
     return df[["start", "system_p_per_kwh"]]
 
 
 # --- Cheapness calculation ---------------------------------------------------
+
 def floor_to_half_hour(ts: pd.Series) -> pd.Series:
-    """Floor timestamps to the nearest half-hour."""
-    # Ensure UTC tz
+    """
+    Floor timestamps to the nearest half-hour (UTC).
+    """
     ts = ts.dt.tz_convert("UTC")
     minutes = (ts.dt.minute // 30) * 30
     return ts.dt.floor("H") + pd.to_timedelta(minutes, unit="m")
@@ -107,7 +113,10 @@ def floor_to_half_hour(ts: pd.Series) -> pd.Series:
 def compute_cheapness(agile_df: pd.DataFrame,
                       system_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Join Agile and system prices by half hour, then compute a 0–100 cheapness score.
+    Join Agile and system prices by half hour, then compute a 0–100 cheapness score:
+    - normalise Agile vs its min/max over the window
+    - normalise system price vs its min/max over the window
+    - cheapness = 100 * (1 - 0.5*agile_norm - 0.5*system_norm)
     """
     if agile_df.empty or system_df.empty:
         return pd.DataFrame()
@@ -119,7 +128,7 @@ def compute_cheapness(agile_df: pd.DataFrame,
     df_a["slot"] = floor_to_half_hour(df_a["start"])
     df_s["slot"] = floor_to_half_hour(df_s["start"])
 
-    # Aggregate in case of duplicates (shouldn’t normally happen)
+    # Aggregate in case of duplicates
     df_a = df_a.groupby("slot", as_index=False).agg(
         {"agile_p_per_kwh": "mean", "end": "max"}
     )
@@ -127,7 +136,7 @@ def compute_cheapness(agile_df: pd.DataFrame,
         {"system_p_per_kwh": "mean"}
     )
 
-    # Inner join on slot -> only overlapping periods kept
+    # Only overlapping periods
     df = pd.merge(df_a, df_s, on="slot", how="inner")
     if df.empty:
         return pd.DataFrame()
@@ -154,6 +163,7 @@ def compute_cheapness(agile_df: pd.DataFrame,
     df["end"] = df["start"] + pd.Timedelta("30min")
 
     return df[["start", "end", "agile_p_per_kwh", "system_p_per_kwh", "cheapness_score"]]
+
 
 # --- Streamlit app -----------------------------------------------------------
 
@@ -190,7 +200,6 @@ def main():
 
     now_utc = dt.datetime.now(dt.timezone.utc)
     end_utc = now_utc + dt.timedelta(hours=48)
-    today = now_utc.date()
 
     # Fetch Agile
     try:
@@ -209,16 +218,16 @@ def main():
         st.warning("No Agile data returned for the given product / region over the next 48 hours.")
         return
 
-    # Fetch system prices
+    # Fetch system prices for the same window
     try:
         with st.spinner("Getting system prices from Elexon…"):
-            system_df = get_system_prices(today)
+            system_df = get_system_prices_for_range(now_utc, end_utc)
     except Exception as e:
         st.error(f"Error getting system prices from Elexon: {e}")
         return
 
     if system_df.empty:
-        st.warning("No system price data returned from Elexon for today / tomorrow.")
+        st.warning("No system price data returned from Elexon for this 48‑hour window.")
         return
 
     # Compute cheapness
