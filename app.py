@@ -52,8 +52,8 @@ def get_agile_prices(product_code: str,
 def get_system_prices_for_range(start_utc: dt.datetime,
                                 end_utc: dt.datetime) -> pd.DataFrame:
     """
-    Get system prices from Elexon Insights (DISEBSP) for all settlement dates
-    covered by [start_utc, end_utc). Returns UTC 'start' and price in p/kWh.
+    Get system prices from Elexon Insights (DISEBSP) for settlement dates
+    covering [start_utc, start_utc + 1 day]. Returns UTC 'start' and price in p/kWh.
     """
     base_url = (
         "https://data.elexon.co.uk/bmrs/api/v1/"
@@ -61,23 +61,23 @@ def get_system_prices_for_range(start_utc: dt.datetime,
     )
 
     start_date = start_utc.date()
-    end_date = end_utc.date()
-    days = (end_date - start_date).days + 1
-    dates = [start_date + dt.timedelta(days=i) for i in range(days)]
+    next_date = start_date + dt.timedelta(days=1)
+    dates = [start_date, next_date]
 
     dfs = []
     for d in dates:
         settlement_date = d.strftime("%Y-%m-%d")
         url = f"{base_url}/{settlement_date}?format=json"
-
-        r = requests.get(url, timeout=15)
-        r.raise_for_status()
+        try:
+            r = requests.get(url, timeout=15)
+        except Exception:
+            continue
+        if r.status_code != 200:
+            continue
         data = r.json()
-
         items = data.get("data") or []
         if not items:
             continue
-
         df_d = pd.DataFrame(items)
         dfs.append(df_d)
 
@@ -85,17 +85,12 @@ def get_system_prices_for_range(start_utc: dt.datetime,
         return pd.DataFrame()
 
     df = pd.concat(dfs, ignore_index=True)
-
-    # Time: startTime is UTC ISO8601
     df["start"] = pd.to_datetime(df["startTime"], utc=True)
-
-    # Price: systemSellPrice in GBP/MWh -> p/kWh
     df["system_gbp_per_mwh"] = df["systemSellPrice"].astype(float)
     df["system_p_per_kwh"] = df["system_gbp_per_mwh"] * 100 / 1000
 
-    # Keep only rows within the Agile window
-    mask = (df["start"] >= start_utc) & (df["start"] < end_utc)
-    df = df.loc[mask].sort_values("start").reset_index(drop=True)
+    # Only require data from the start of the Agile window onwards
+    df = df[df["start"] >= start_utc].sort_values("start").reset_index(drop=True)
     return df[["start", "system_p_per_kwh"]]
 
 
@@ -218,7 +213,7 @@ def main():
         st.warning("No Agile data returned for the given product / region over the next 48 hours.")
         return
 
-    # Fetch system prices for the same window
+    # Fetch system prices for the same window (today + tomorrow)
     try:
         with st.spinner("Getting system prices from Elexon…"):
             system_df = get_system_prices_for_range(now_utc, end_utc)
