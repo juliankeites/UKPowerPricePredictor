@@ -220,6 +220,9 @@ def main():
     if system_df.empty:
         st.warning("No system price data returned from Elexon for today/tomorrow.")
         return
+st.write("Agile rows:", len(agile_df), "System rows:", len(system_df))
+st.write("Agile time range:", agile_df["start"].min(), agile_df["start"].max())
+st.write("System time range:", system_df["start"].min(), system_df["start"].max())
 
     # Compute cheapness
     cheap_df = compute_cheapness(agile_df, system_df)
@@ -274,9 +277,6 @@ def main():
         "Agile prices from Octopus and system prices from Elexon Insights are "
         "normalised over the next 48 hours to produce a 0–100 cheapness score per half‑hour."
     )
-st.write("Agile rows:", len(agile_df), "System rows:", len(system_df))
-st.write("Agile time range:", agile_df["start"].min(), agile_df["start"].max())
-st.write("System time range:", system_df["start"].min(), system_df["start"].max())
 
 
 if __name__ == "__main__":
