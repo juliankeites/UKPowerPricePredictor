@@ -49,29 +49,34 @@ def get_agile_prices(product_code: str,
 
 # --- Elexon system price (DISEBSP) helper ------------------------------------
 
-def get_system_prices(today: dt.date) -> pd.DataFrame:
+def get_system_prices_for_range(start_utc: dt.datetime,
+                                end_utc: dt.datetime) -> pd.DataFrame:
     """
-    Get system prices for today and tomorrow from Elexon Insights (DISEBSP).
-    Returns half‑hourly UTC 'start' and price in p/kWh (using systemSellPrice).
+    Get system prices from Elexon Insights (DISEBSP) for all settlement dates
+    covered by [start_utc, end_utc). Returns UTC 'start' and p/kWh.
     """
     base_url = (
         "https://data.elexon.co.uk/bmrs/api/v1/"
         "balancing/settlement/system-prices"
     )
 
+    # All settlement dates in the Agile window
+    start_date = start_utc.date()
+    end_date = end_utc.date()
+    days = (end_date - start_date).days + 1
+    dates = [start_date + dt.timedelta(days=i) for i in range(days)]
+
     dfs = []
-    for d in [today, today + dt.timedelta(days=1)]:
+    for d in dates:
         settlement_date = d.strftime("%Y-%m-%d")
         url = f"{base_url}/{settlement_date}?format=json"
 
         r = requests.get(url, timeout=15)
         r.raise_for_status()
         data = r.json()
-
         items = data.get("data") or []
         if not items:
             continue
-
         df_d = pd.DataFrame(items)
         dfs.append(df_d)
 
@@ -79,15 +84,14 @@ def get_system_prices(today: dt.date) -> pd.DataFrame:
         return pd.DataFrame()
 
     df = pd.concat(dfs, ignore_index=True)
-
-    # Time: startTime is already UTC ISO8601
     df["start"] = pd.to_datetime(df["startTime"], utc=True)
-
-    # Price: systemSellPrice in GBP/MWh -> convert to p/kWh
     df["system_gbp_per_mwh"] = df["systemSellPrice"].astype(float)
     df["system_p_per_kwh"] = df["system_gbp_per_mwh"] * 100 / 1000
 
-    df = df.sort_values("start").reset_index(drop=True)
+    # Keep only rows that fall inside the Agile time window
+    mask = (df["start"] >= start_utc) & (df["start"] < end_utc)
+    df = df.loc[mask].sort_values("start").reset_index(drop=True)
+
     return df[["start", "system_p_per_kwh"]]
 
 
