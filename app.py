@@ -92,27 +92,43 @@ def get_system_prices(today: dt.date) -> pd.DataFrame:
 
 
 # --- Cheapness calculation ---------------------------------------------------
+def floor_to_half_hour(ts: pd.Series) -> pd.Series:
+    """Floor timestamps to the nearest half-hour."""
+    # Ensure UTC tz
+    ts = ts.dt.tz_convert("UTC")
+    minutes = (ts.dt.minute // 30) * 30
+    return ts.dt.floor("H") + pd.to_timedelta(minutes, unit="m")
+
 
 def compute_cheapness(agile_df: pd.DataFrame,
                       system_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Join Agile and system prices by half hour, then compute a 0–100 cheapness score:
-    - normalise Agile vs its min/max over the window
-    - normalise system price vs its min/max over the window
-    - cheapness = 100 * (1 - 0.5*agile_norm - 0.5*system_norm)
+    Join Agile and system prices by half hour, then compute a 0–100 cheapness score.
     """
     if agile_df.empty or system_df.empty:
         return pd.DataFrame()
 
-    df = pd.merge_asof(
-        agile_df.sort_values("start"),
-        system_df.sort_values("start"),
-        on="start",
-        direction="nearest",
-        tolerance=pd.Timedelta("15min"),
+    df_a = agile_df.copy()
+    df_s = system_df.copy()
+
+    # Align both to half-hour buckets
+    df_a["slot"] = floor_to_half_hour(df_a["start"])
+    df_s["slot"] = floor_to_half_hour(df_s["start"])
+
+    # Aggregate in case of duplicates (shouldn’t normally happen)
+    df_a = df_a.groupby("slot", as_index=False).agg(
+        {"agile_p_per_kwh": "mean", "end": "max"}
+    )
+    df_s = df_s.groupby("slot", as_index=False).agg(
+        {"system_p_per_kwh": "mean"}
     )
 
-    df = df.dropna(subset=["system_p_per_kwh"]).copy()
+    # Inner join on slot -> only overlapping periods kept
+    df = pd.merge(df_a, df_s, on="slot", how="inner")
+    if df.empty:
+        return pd.DataFrame()
+
+    df = df.rename(columns={"slot": "start"})
 
     # Normalise Agile
     a_min, a_max = df["agile_p_per_kwh"].min(), df["agile_p_per_kwh"].max()
@@ -129,8 +145,11 @@ def compute_cheapness(agile_df: pd.DataFrame,
         df["system_norm"] = 0.5
 
     df["cheapness_score"] = 100 * (1 - 0.5 * df["agile_norm"] - 0.5 * df["system_norm"])
-    return df[["start", "end", "agile_p_per_kwh", "system_p_per_kwh", "cheapness_score"]]
 
+    # Approximate end time as start + 30 minutes
+    df["end"] = df["start"] + pd.Timedelta("30min")
+
+    return df[["start", "end", "agile_p_per_kwh", "system_p_per_kwh", "cheapness_score"]]
 
 # --- Streamlit app -----------------------------------------------------------
 
