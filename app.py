@@ -1,5 +1,4 @@
 import datetime as dt
-import math
 
 import pandas as pd
 import requests
@@ -49,20 +48,19 @@ def get_agile_prices(product_code: str,
 
 # --- Elexon system price (DISEBSP) helper ------------------------------------
 
-def get_system_prices_for_range(start_utc: dt.datetime,
-                                end_utc: dt.datetime) -> pd.DataFrame:
+def get_system_prices_today_and_tomorrow(now_utc: dt.datetime) -> pd.DataFrame:
     """
-    Get system prices from Elexon Insights (DISEBSP) for settlement dates
-    covering [start_utc, start_utc + 1 day]. Returns UTC 'start' and price in p/kWh.
+    Get system prices from Elexon Insights (DISEBSP) for today and tomorrow.
+    Returns UTC 'start' and price in p/kWh (systemSellPrice).
     """
     base_url = (
         "https://data.elexon.co.uk/bmrs/api/v1/"
         "balancing/settlement/system-prices"
     )
 
-    start_date = start_utc.date()
-    next_date = start_date + dt.timedelta(days=1)
-    dates = [start_date, next_date]
+    today = now_utc.date()
+    tomorrow = today + dt.timedelta(days=1)
+    dates = [today, tomorrow]
 
     dfs = []
     for d in dates:
@@ -88,9 +86,7 @@ def get_system_prices_for_range(start_utc: dt.datetime,
     df["start"] = pd.to_datetime(df["startTime"], utc=True)
     df["system_gbp_per_mwh"] = df["systemSellPrice"].astype(float)
     df["system_p_per_kwh"] = df["system_gbp_per_mwh"] * 100 / 1000
-
-    # Only require data from the start of the Agile window onwards
-    df = df[df["start"] >= start_utc].sort_values("start").reset_index(drop=True)
+    df = df.sort_values("start").reset_index(drop=True)
     return df[["start", "system_p_per_kwh"]]
 
 
@@ -213,16 +209,16 @@ def main():
         st.warning("No Agile data returned for the given product / region over the next 48 hours.")
         return
 
-    # Fetch system prices for the same window (today + tomorrow)
+    # Fetch system prices for today and tomorrow
     try:
         with st.spinner("Getting system prices from Elexon…"):
-            system_df = get_system_prices_for_range(now_utc, end_utc)
+            system_df = get_system_prices_today_and_tomorrow(now_utc)
     except Exception as e:
         st.error(f"Error getting system prices from Elexon: {e}")
         return
 
     if system_df.empty:
-        st.warning("No system price data returned from Elexon for this 48‑hour window.")
+        st.warning("No system price data returned from Elexon for today/tomorrow.")
         return
 
     # Compute cheapness
