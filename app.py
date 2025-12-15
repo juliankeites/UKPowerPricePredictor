@@ -274,6 +274,9 @@ def main():
         "Agile prices from Octopus and system prices from Elexon Insights are "
         "normalised over the next 48 hours to produce a 0–100 cheapness score per half‑hour."
     )
+st.write("Agile rows:", len(agile_df), "System rows:", len(system_df))
+st.write("Agile time range:", agile_df["start"].min(), agile_df["start"].max())
+st.write("System time range:", system_df["start"].min(), system_df["start"].max())
 
 
 if __name__ == "__main__":
