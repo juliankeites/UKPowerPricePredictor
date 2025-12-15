@@ -1,22 +1,33 @@
 import datetime as dt
 import math
-import requests
+
 import pandas as pd
-from elexonpy.api_client import ApiClient
-from elexonpy.api.indicative_imbalance_settlement_api import IndicativeImbalanceSettlementApi
+import requests
+import streamlit as st
+
+# --- Octopus Agile helper ----------------------------------------------------
 
 OCTOPUS_BASE = "https://api.octopus.energy/v1"
 
-def get_agile_prices(product_code: str, region_code: str,
-                     start_utc: dt.datetime, end_utc: dt.datetime) -> pd.DataFrame:
-    """Half-hour Agile unit rates (p/kWh) for your GSP/region."""
+
+def get_agile_prices(product_code: str,
+                     region_code: str,
+                     start_utc: dt.datetime,
+                     end_utc: dt.datetime) -> pd.DataFrame:
+    """
+    Half-hour Agile unit rates (p/kWh) for your GSP/region.
+    """
     tariff_code = f"E-1R-{product_code}-{region_code}"
-    url = f"{OCTOPUS_BASE}/products/{product_code}/electricity-tariffs/{tariff_code}/standard-unit-rates/"
+    url = (
+        f"{OCTOPUS_BASE}/products/"
+        f"{product_code}/electricity-tariffs/{tariff_code}/standard-unit-rates/"
+    )
     params = {
         "period_from": start_utc.isoformat(timespec="seconds").replace("+00:00", "Z"),
         "period_to": end_utc.isoformat(timespec="seconds").replace("+00:00", "Z"),
         "page_size": 1500,
     }
+
     results = []
     while url:
         r = requests.get(url, params=params if not results else None, timeout=15)
@@ -24,6 +35,7 @@ def get_agile_prices(product_code: str, region_code: str,
         data = r.json()
         results.extend(data.get("results", []))
         url = data.get("next")
+
     if not results:
         return pd.DataFrame()
 
@@ -34,33 +46,52 @@ def get_agile_prices(product_code: str, region_code: str,
     df = df.sort_values("start").reset_index(drop=True)
     return df[["start", "end", "agile_p_per_kwh"]]
 
+
+# --- Elexon system price (DISEBSP) helper ------------------------------------
+
 def get_system_prices(today: dt.date) -> pd.DataFrame:
     """
-    Pull settlement system prices for today and tomorrow via Elexon.
-    Assumes Elexon key is configured for elexonpy as per its docs.
+    Get system prices for today and tomorrow from Elexon Insights (DISEBSP).
+    Returns half‑hourly UTC 'start' and price in p/kWh (using systemSellPrice).
     """
-    api_client = ApiClient()
-    imbalance_api = IndicativeImbalanceSettlementApi(api_client)
+    base_url = (
+        "https://data.elexon.co.uk/bmrs/api/v1/"
+        "balancing/settlement/system-prices"
+    )
 
     dfs = []
     for d in [today, today + dt.timedelta(days=1)]:
         settlement_date = d.strftime("%Y-%m-%d")
-        df_d = imbalance_api.balancing_settlement_system_prices_settlement_date_get(
-            settlement_date=settlement_date,
-            format="dataframe"
-        )
+        url = f"{base_url}/{settlement_date}?format=json"
+
+        r = requests.get(url, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+
+        items = data.get("data") or []
+        if not items:
+            continue
+
+        df_d = pd.DataFrame(items)
         dfs.append(df_d)
+
+    if not dfs:
+        return pd.DataFrame()
+
     df = pd.concat(dfs, ignore_index=True)
 
-    # elexonpy returns timestamps and prices; standardise column names
-    # You may need to adjust to the exact column names from the API.
-    # Example: 'settlement_period_start' in UTC and price in GBP/MWh.
-    df["start"] = pd.to_datetime(df["settlement_period_start"], utc=True)
-    df["system_gbp_per_mwh"] = df["system_price"].astype(float)
-    # Convert to p/kWh to align with Agile
+    # Time: startTime is already UTC ISO8601
+    df["start"] = pd.to_datetime(df["startTime"], utc=True)
+
+    # Price: systemSellPrice in GBP/MWh -> convert to p/kWh
+    df["system_gbp_per_mwh"] = df["systemSellPrice"].astype(float)
     df["system_p_per_kwh"] = df["system_gbp_per_mwh"] * 100 / 1000
+
     df = df.sort_values("start").reset_index(drop=True)
     return df[["start", "system_p_per_kwh"]]
+
+
+# --- Cheapness calculation ---------------------------------------------------
 
 def compute_cheapness(agile_df: pd.DataFrame,
                       system_df: pd.DataFrame) -> pd.DataFrame:
@@ -70,15 +101,17 @@ def compute_cheapness(agile_df: pd.DataFrame,
     - normalise system price vs its min/max over the window
     - cheapness = 100 * (1 - 0.5*agile_norm - 0.5*system_norm)
     """
+    if agile_df.empty or system_df.empty:
+        return pd.DataFrame()
+
     df = pd.merge_asof(
         agile_df.sort_values("start"),
         system_df.sort_values("start"),
         on="start",
         direction="nearest",
-        tolerance=pd.Timedelta("15min")
+        tolerance=pd.Timedelta("15min"),
     )
 
-    # Drop rows without system price
     df = df.dropna(subset=["system_p_per_kwh"]).copy()
 
     # Normalise Agile
@@ -95,33 +128,130 @@ def compute_cheapness(agile_df: pd.DataFrame,
     else:
         df["system_norm"] = 0.5
 
-    # 0 = very expensive, 100 = very cheap
     df["cheapness_score"] = 100 * (1 - 0.5 * df["agile_norm"] - 0.5 * df["system_norm"])
     return df[["start", "end", "agile_p_per_kwh", "system_p_per_kwh", "cheapness_score"]]
 
+
+# --- Streamlit app -----------------------------------------------------------
+
 def main():
-    # Window: today + tomorrow UTC
-    today = dt.datetime.now(dt.timezone.utc).date()
-    start_utc = dt.datetime.combine(today, dt.time(0, 0), tzinfo=dt.timezone.utc)
-    end_utc = start_utc + dt.timedelta(days=2)
+    st.set_page_config(page_title="UK Power Price & Cheapness", layout="wide")
+    st.title("UK Power Price & Cheapness – Next 48 Hours")
 
-    # Fill in your Agile product / region
-    product_code = "AGILE-24-10-01"  # example; use your live product code
-    region_code = "H"                # your GSP/region letter
+    with st.sidebar:
+        st.header("Settings")
 
-    agile_df = get_agile_prices(product_code, region_code, start_utc, end_utc)
+        product_code = st.text_input(
+            "Agile product code",
+            value="AGILE-24-10-01",
+            help="Current Agile product code; check your tariff / Octopus API docs.",
+        )
+        region_code = st.text_input(
+            "Region code (GSP letter A–P)",
+            value="H",
+            help="Your GSP / DNO region letter used in Agile tariff codes.",
+        )
+
+        tz_choice = st.selectbox(
+            "Display time in",
+            ["Local time (UK)", "UTC"],
+            index=0,
+        )
+
+        if st.button("Fetch & calculate next 48h"):
+            st.session_state["run"] = True
+
+    if "run" not in st.session_state or not st.session_state["run"]:
+        st.info("Configure settings in the sidebar and click **Fetch & calculate next 48h**.")
+        return
+
+    now_utc = dt.datetime.now(dt.timezone.utc)
+    end_utc = now_utc + dt.timedelta(hours=48)
+    today = now_utc.date()
+
+    # Fetch Agile
+    try:
+        with st.spinner("Getting Agile prices from Octopus…"):
+            agile_df = get_agile_prices(
+                product_code=product_code.strip(),
+                region_code=region_code.strip().upper(),
+                start_utc=now_utc,
+                end_utc=end_utc,
+            )
+    except Exception as e:
+        st.error(f"Error getting Agile prices: {e}")
+        return
+
     if agile_df.empty:
-        raise SystemExit("No Agile data returned for this product/region.")
+        st.warning("No Agile data returned for the given product / region over the next 48 hours.")
+        return
 
-    system_df = get_system_prices(today)
+    # Fetch system prices
+    try:
+        with st.spinner("Getting system prices from Elexon…"):
+            system_df = get_system_prices(today)
+    except Exception as e:
+        st.error(f"Error getting system prices from Elexon: {e}")
+        return
+
+    if system_df.empty:
+        st.warning("No system price data returned from Elexon for today / tomorrow.")
+        return
+
+    # Compute cheapness
     cheap_df = compute_cheapness(agile_df, system_df)
+    if cheap_df.empty:
+        st.warning("Could not compute cheapness score (no overlapping Agile & system price data).")
+        return
 
-    # Show rolling cheapness for today/tomorrow
-    print(cheap_df.to_string(index=False, formatters={
-        "agile_p_per_kwh": "{:.2f}".format,
-        "system_p_per_kwh": "{:.2f}".format,
-        "cheapness_score": "{:.1f}".format,
-    }))
+    # Timezone choice
+    if tz_choice.startswith("Local"):
+        cheap_df["time"] = cheap_df["start"].dt.tz_convert("Europe/London")
+    else:
+        cheap_df["time"] = cheap_df["start"]
+
+    st.subheader("Cheapness table")
+
+    st.dataframe(
+        cheap_df[["time", "agile_p_per_kwh", "system_p_per_kwh", "cheapness_score"]]
+        .rename(
+            columns={
+                "time": "time",
+                "agile_p_per_kwh": "Agile (p/kWh)",
+                "system_p_per_kwh": "System (p/kWh)",
+                "cheapness_score": "Cheapness (0–100)",
+            }
+        )
+        .style.format(
+            {
+                "Agile (p/kWh)": "{:.2f}",
+                "System (p/kWh)": "{:.2f}",
+                "Cheapness (0–100)": "{:.1f}",
+            }
+        ),
+        use_container_width=True,
+        height=500,
+    )
+
+    st.subheader("Price & cheapness over time")
+
+    chart_df = cheap_df.copy()
+    chart_df = chart_df.set_index("time")
+
+    st.line_chart(
+        chart_df[["agile_p_per_kwh", "system_p_per_kwh"]],
+        height=300,
+    )
+    st.area_chart(
+        chart_df[["cheapness_score"]],
+        height=200,
+    )
+
+    st.caption(
+        "Agile prices from Octopus and system prices from Elexon Insights are "
+        "normalised over the next 48 hours to produce a 0–100 cheapness score per half‑hour."
+    )
+
 
 if __name__ == "__main__":
     main()
